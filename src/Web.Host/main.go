@@ -1,107 +1,193 @@
 package main
 
 import (
-	"fmt"
+	"encoding/json"
 	"log"
 	"net/http"
+	"sync"
+	"time"
 
-	"example.com/Web.Host/utils"
-	"github.com/gorilla/mux"
-    "github.com/jinzhu/gorm"
+	"github.com/gorilla/websocket"
+	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/mysql"
+
 )
 
-// User User構造体
-type User struct {
-    ID        int
-    FirstName string
-    LastName  string
+// ----------------------------------------------------------------
+// DBモデル定義
+// ----------------------------------------------------------------
+
+// Answer は数独の各セルの解答状態を表します。
+type Answer struct {
+	ID         uint   `gorm:"primary_key"`
+	CellIndex  int    `gorm:"column:cell_index"`  // 1～81
+	CellNumber int    `gorm:"column:cell_number"` // 解答（例：0=空 or 数字）
+	SessionID  string `gorm:"column:session_id"`  // ルーム（セッション）ID
 }
 
-
-func main() {
-    router := mux.NewRouter().StrictSlash(true)
-    router.HandleFunc("/", home)
-    router.HandleFunc("/users", insertSolution)
-    // router.HandleFunc("/users", findSolution)
-    http.ListenAndServe(":8080", router)
+// Room は各セッション（ルーム）の情報を保持します。
+type Room struct {
+	SessionID string    `gorm:"primary_key;column:session_id"`
+	CreatedAt time.Time
+	Answers   []Answer  `gorm:"foreignkey:SessionID;association_foreignkey:SessionID"`
 }
 
+// ----------------------------------------------------------------
+// インメモリルーム管理（WebSocket接続管理用）
+// ----------------------------------------------------------------
 
-func home(w http.ResponseWriter, r *http.Request) {
-    fmt.Fprintf(w, "Hello World")
+type RoomHub struct {
+	clients map[*websocket.Conn]bool
+	mu      sync.Mutex
 }
 
-func findAllUsers(w http.ResponseWriter, r *http.Request) {
-    // DB接続
-    db := utils.GetConnection()
-    
-    defer db.Close()
-    var userList []User
-    db.Find(&userList)
-
-    // 共通化した処理を使う
-    utils.RespondWithJSON(w, http.StatusOK, userList)
+func NewRoomHub() *RoomHub {
+	return &RoomHub{clients: make(map[*websocket.Conn]bool)}
 }
 
-func insertSolution(w http.ResponseWriter, r *http.Request){
-    
-    w.Header().Set("Access-Control-Allow-Headers", "*")
-    w.Header().Set("Access-Control-Allow-Origin", "*")
-    w.Header().Set( "Access-Control-Allow-Methods","GET, POST, PUT, DELETE, OPTIONS" )
-    var solutions []solutions
-   
-   // DB接続
-   db, err := gorm.Open("mysql", "root:pass@unix(/var/lib/mysql/mysql.sock)/sudoku?charset=utf8&parseTime=True&loc=Local")
-   // 接続に失敗したらエラーログを出して終了する
-   if err != nil {
-       log.Fatalf("DB connection failed %v", err)
-   }
-   db.LogMode(true)
-   db.Delete(&solutions)
-
-   solutions = createSolution()
-    // DBにINSERTする
-    for i := range solutions {
-    db.Create(solutions[i])
-    }
-    defer db.Close()
-
-    utils.RespondWithJSON(w, http.StatusOK, solutions)
+func (hub *RoomHub) Broadcast(message []byte) {
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+	for client := range hub.clients {
+		if err := client.WriteMessage(websocket.TextMessage, message); err != nil {
+			log.Println("Broadcast WriteMessage error:", err)
+			client.Close()
+			delete(hub.clients, client)
+		}
+	}
 }
 
-func findSolution(w http.ResponseWriter, r *http.Request){
-    // DB接続
-    db, err := gorm.Open("mysql", "root:pass@unix(/var/lib/mysql/mysql.sock)/sudoku?charset=utf8&parseTime=True&loc=Local")
-    // 接続に失敗したらエラーログを出して終了する
-    if err != nil {
-        log.Fatalf("DB connection failed %v", err)
-    }
-    db.LogMode(true)
-    defer db.Close()
+var (
+	rooms   = make(map[string]*RoomHub)
+	roomsMu sync.Mutex
 
-    var solutions solutions
-    db.Find(&solutions)
+	db *gorm.DB
+)
 
-    // 共通化した処理を使う
-    //utils.RespondWithJSON(w, http.StatusOK, db)
+// ----------------------------------------------------------------
+// WebSocket サーバ実装
+// ----------------------------------------------------------------
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-func findByID(w http.ResponseWriter, r *http.Request) {
-
-    id, err := utils.GetID(r)
-    if err != nil {
-        utils.RespondWithError(w, http.StatusBadRequest, "Invalid parameter")
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+    sessionID := r.URL.Query().Get("sessionID")
+    if sessionID == "" {
+        http.Error(w, "sessionID is required", http.StatusBadRequest)
         return
     }
 
-    // DB接続
-    db := utils.GetConnection()
-    defer db.Close()
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        log.Println("WebSocket Upgrade error:", err)
+        return
+    }
+    defer conn.Close()
 
-    var user User
-    db.Where("id = ?", id).Find(&user)
+    // --- ここでは初期盤面をすぐ送らない！ --- 
 
-    // 共通化した処理を使う
-    utils.RespondWithJSON(w, http.StatusOK, user)
+    roomsMu.Lock()
+    hub, exists := rooms[sessionID]
+    if !exists {
+        hub = NewRoomHub()
+        rooms[sessionID] = hub
+    }
+    roomsMu.Unlock()
+
+    hub.mu.Lock()
+    hub.clients[conn] = true
+    hub.mu.Unlock()
+
+    // ここからクライアントごとにメッセージ受信ループ
+    for {
+        messageType, msg, err := conn.ReadMessage()
+        if err != nil {
+            log.Println("ReadMessage warning:", err)
+            break
+        }
+
+        if messageType == websocket.TextMessage {
+            var header struct {
+                Type string `json:"type"`
+            }
+            if err := json.Unmarshal(msg, &header); err != nil {
+                log.Println("JSON unmarshal error:", err)
+                continue
+            }
+
+            switch header.Type {
+            case "getInitialBoard":
+                // 🔥 ここで、その時点で最新のRoom情報をDBから読む！
+                var room Room
+                if err := db.Preload("Answers").Where("session_id = ?", sessionID).First(&room).Error; err != nil {
+                    log.Println("DB fetch error:", err)
+                    continue
+                }
+
+                initialMessage, err := json.Marshal(room.Answers)
+                if err != nil {
+                    log.Println("JSON marshal error:", err)
+                    continue
+                }
+
+                if err := conn.WriteMessage(websocket.TextMessage, initialMessage); err != nil {
+                    log.Println("Write initial board error:", err)
+                } else {
+                    log.Println("Sent initial board to this connection!")
+                }
+
+            case "updateCell":
+                var update struct {
+                    CellIndex  int `json:"cellIndex"`
+                    CellNumber int `json:"cellNumber"`
+                }
+                if err := json.Unmarshal(msg, &update); err != nil {
+                    log.Println("JSON unmarshal error:", err)
+                    continue
+                }
+
+                if err := db.Model(&Answer{}).
+                    Where("session_id = ? AND cell_index = ?", sessionID, update.CellIndex).
+                    Update("cell_number", update.CellNumber).Error; err != nil {
+                    log.Println("DB update error:", err)
+                } else {
+                    // 全員に反映
+                    hub.Broadcast(msg)
+                }
+            default:
+                log.Println("Unknown message type:", header.Type)
+            }
+        }
+    }
+
+    // 切断処理
+    roomsMu.Lock()
+    if hub, ok := rooms[sessionID]; ok {
+        hub.mu.Lock()
+        delete(hub.clients, conn)
+        hub.mu.Unlock()
+    }
+    roomsMu.Unlock()
+}
+
+func main() {
+	var err error
+	// DSN（例: "root:root@tcp(localhost:3306)/sudoku_db?parseTime=true"）は環境に合わせて変更してください
+	db, err = gorm.Open("mysql", "user:passpass@tcp(localhost:3307)/sudoku-db?parseTime=true")
+	if err != nil {
+		log.Fatal("Failed to connect to database:", err)
+	}
+	defer db.Close()
+
+	// Room, Answer テーブルの自動マイグレーション
+	db.AutoMigrate(&Room{}, &Answer{})
+
+	// WebSocket ハンドラをセットアップ
+	http.HandleFunc("/ws", wsHandler)
+	log.Println("WebSocket server running on :8081")
+	if err := http.ListenAndServe(":8081", nil); err != nil {
+		log.Fatal("ListenAndServe error:", err)
+	}
 }
