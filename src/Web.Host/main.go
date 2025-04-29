@@ -33,6 +33,14 @@ type Problem struct {
     SessionID  string `gorm:"column:session_id"`
 }
 
+
+type Submit struct {
+    SessionID  string `gorm:"column:session_id;primary_key"`
+    UserID     string `gorm:"column:user_id;primary_key"`
+    CellIndex  int    `gorm:"column:cell_index;primary_key"`
+    CellNumber int    `gorm:"column:cell_number"`
+}
+
 // Room は各セッション（ルーム）の情報を保持します。
 type Room struct {
 	SessionID string    `gorm:"primary_key;column:session_id"`
@@ -74,17 +82,46 @@ var (
 	db *gorm.DB
 )
 
-// ----------------------------------------------------------------
-// WebSocket サーバ実装
-// ----------------------------------------------------------------
+// calcScore は、セッションIDとユーザーIDを元に、正答数と完了状態を計算します。
+func calcScore(sessionID, userID string) (correct int, finished bool) {
+    var answers []Answer
+    db.Where("session_id = ?", sessionID).Find(&answers)
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+    var problems []Problem
+    db.Where("session_id = ?", sessionID).Find(&problems)
+    prefilled := make(map[int]int)
+    for _, p := range problems {
+        if p.CellNumber != 0 {
+            prefilled[p.CellIndex] = p.CellNumber
+        }
+    }
+
+    var submits []Submit
+    db.Where("session_id = ? AND user_id = ?", sessionID, userID).Find(&submits)
+    subMap := make(map[int]int, len(submits))
+    for _, s := range submits {
+        subMap[s.CellIndex] = s.CellNumber
+    }
+
+    finished = true
+    correct = 0
+    for _, a := range answers {
+        if v, ok := prefilled[a.CellIndex]; ok && v == a.CellNumber {
+            correct++
+            continue
+        }
+        if subMap[a.CellIndex] == a.CellNumber {
+            correct++
+            continue
+        }
+        finished = false
+    }
+    return
 }
 
 // createProblem は数独の問題を生成します。
 func createProblem(answers []answer) []Problem {
-    const holeCount = 40 // 空白にするマスの数（調整可能）
+    const holeCount = 1 // 空白にするマスの数（調整可能）
     rand.Seed(time.Now().UnixNano())
 
     // 1〜81からholeCount個ランダムに穴を開けるマスを選ぶ
@@ -109,6 +146,15 @@ func createProblem(answers []answer) []Problem {
     return problems
 }
 
+// ----------------------------------------------------------------
+// WebSocket サーバ実装
+// ----------------------------------------------------------------
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+// wsHandler は WebSocket 接続を処理します。
+// セッションIDをクエリパラメータから取得し、ルームを管理します。
 func wsHandler(w http.ResponseWriter, r *http.Request) {
     sessionID := r.URL.Query().Get("sessionID")
     if sessionID == "" {
@@ -228,7 +274,60 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
                 } else {
                     hub.Broadcast(msg)
                 }
+            case "commitUpdate":
+                // 1) payload 読み取り
+                var p struct {
+                    UserID     string `json:"userID"`
+                    CellIndex  int    `json:"cellIndex"`
+                    CellNumber int    `json:"cellNumber"`
+                }
+                if err := json.Unmarshal(msg, &p); err != nil {
+                    log.Println("JSON unmarshal error:", err)
+                    continue
+                }
 
+                // 2) submits テーブルに upsert
+                submit := Submit{
+                    SessionID:  sessionID,
+                    UserID:     p.UserID,
+                    CellIndex:  p.CellIndex,
+                    CellNumber: p.CellNumber,
+                }
+                db.Where(Submit{
+                    SessionID: sessionID,
+                    UserID:    p.UserID,
+                    CellIndex: p.CellIndex,
+                }).Assign(Submit{CellNumber: p.CellNumber}).FirstOrCreate(&submit)
+
+                // 3) 他プレイヤに「このセルを確定したよ」通知
+                hub.Broadcast(msg)
+
+                // 4) 今回の確定を踏まえて “finished” かチェック
+                correct, finished := calcScore(sessionID, p.UserID)
+                println("Score calculated:", correct, finished)
+                if finished {
+                    // 相手の userID を取得
+                    var opponent string
+                    db.Table("submits").
+                        Where("session_id = ? AND user_id != ?", sessionID, p.UserID).
+                        Pluck("DISTINCT user_id", &opponent)
+
+                    // 相手スコア取得
+                    oppCorrect, _ := calcScore(sessionID, opponent)
+
+                    // 5) gameFinished を全員に broadcast
+                    res := struct {
+                        Type            string `json:"type"`
+                        YourCorrect     int    `json:"yourCorrect"`
+                        OpponentCorrect int    `json:"opponentCorrect"`
+                    }{
+                        Type:            "gameFinished",
+                        YourCorrect:     correct,
+                        OpponentCorrect: oppCorrect,
+                    }
+                    data, _ := json.Marshal(res)
+                    hub.Broadcast(data)
+                }
             default:
                 log.Println("Unknown message type:", header.Type)
             }
@@ -255,7 +354,7 @@ func main() {
 	defer db.Close()
 
 	// Room, Answer テーブルの自動マイグレーション
-	db.AutoMigrate(&Room{}, &Answer{}, &Problem{})
+	db.AutoMigrate(&Room{}, &Answer{}, &Problem{}, &Submit{})
 
 	// WebSocket ハンドラをセットアップ
 	http.HandleFunc("/ws", wsHandler)

@@ -20,3 +20,7 @@ cd src/Web.Host
 go mod tidy
 go build ./*.go
 go run ./*.go
+
+## memo
+```
+creatAnswerの実行ファイルの変更でおかしくなる。・
