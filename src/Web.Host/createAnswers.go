@@ -18,6 +18,7 @@ type cell struct {
 type answer struct {
 	CellIndex int
 	CellNumber int
+	SessionID string
 }
 // セルを9X9持った配列
 var cellsArray []cell
