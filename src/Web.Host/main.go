@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
+    "math/rand"
 	"github.com/gorilla/websocket"
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/mysql"
@@ -25,11 +25,21 @@ type Answer struct {
 	SessionID  string `gorm:"column:session_id"`  // ルーム（セッション）ID
 }
 
+// problem は数独の各セルの問題状態を表します。
+type Problem struct {
+    ID         uint   `gorm:"primary_key"`
+    CellIndex  int    `gorm:"column:cell_index"`
+    CellNumber int    `gorm:"column:cell_number"` // 0なら空白
+    SessionID  string `gorm:"column:session_id"`
+}
+
 // Room は各セッション（ルーム）の情報を保持します。
 type Room struct {
 	SessionID string    `gorm:"primary_key;column:session_id"`
 	CreatedAt time.Time
 	Answers   []Answer  `gorm:"foreignkey:SessionID;association_foreignkey:SessionID"`
+    Problems  []Problem `gorm:"foreignkey:SessionID;association_foreignkey:SessionID"`
+
 }
 
 // ----------------------------------------------------------------
@@ -72,6 +82,33 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+// createProblem は数独の問題を生成します。
+func createProblem(answers []answer) []Problem {
+    const holeCount = 40 // 空白にするマスの数（調整可能）
+    rand.Seed(time.Now().UnixNano())
+
+    // 1〜81からholeCount個ランダムに穴を開けるマスを選ぶ
+    indices := rand.Perm(81)[:holeCount]
+    holes := make(map[int]bool)
+    for _, idx := range indices {
+        holes[idx+1] = true // 1始まりに合わせる
+    }
+
+    var problems []Problem
+    for _, ans := range answers {
+        cellNumber := ans.CellNumber
+        if holes[ans.CellIndex] {
+            cellNumber = 0 // 穴をあけるマスは 0 にする
+        }
+        problems = append(problems, Problem{
+            CellIndex:  ans.CellIndex,
+            CellNumber: cellNumber,
+            SessionID:  ans.SessionID,
+        })
+    }
+    return problems
+}
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
     sessionID := r.URL.Query().Get("sessionID")
     if sessionID == "" {
@@ -86,8 +123,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
     }
     defer conn.Close()
 
-    // --- ここでは初期盤面をすぐ送らない！ --- 
-
     roomsMu.Lock()
     hub, exists := rooms[sessionID]
     if !exists {
@@ -100,7 +135,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
     hub.clients[conn] = true
     hub.mu.Unlock()
 
-    // ここからクライアントごとにメッセージ受信ループ
     for {
         messageType, msg, err := conn.ReadMessage()
         if err != nil {
@@ -119,14 +153,52 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
             switch header.Type {
             case "getInitialBoard":
-                // 🔥 ここで、その時点で最新のRoom情報をDBから読む！
+                // ⭐ ここでRoomを探す（ProblemもPreload）
                 var room Room
-                if err := db.Preload("Answers").Where("session_id = ?", sessionID).First(&room).Error; err != nil {
-                    log.Println("DB fetch error:", err)
-                    continue
+                log.Println("Room loaded:", room.SessionID, "Problems count:", len(room.Problems))
+                if err := db.Preload("Problems").Where("session_id = ?", sessionID).First(&room).Error; err != nil {
+                    log.Println("Room not found, generating new board...")
+
+                    // 🔥 完成盤面を作る
+                    generatedAnswers := createAnswer()
+
+                    // 🔥 問題盤面を作る
+                    generatedProblems := createProblem(generatedAnswers)
+
+                    // 🔥 Roomを作って保存
+                    var answers []Answer
+                    for _, cell := range generatedAnswers {
+                        answers = append(answers, Answer{
+                            CellIndex:  cell.CellIndex,
+                            CellNumber: cell.CellNumber,
+                            SessionID:  sessionID,
+                        })
+                    }
+
+                    var problems []Problem
+                    for _, cell := range generatedProblems {
+                        problems = append(problems, Problem{
+                            CellIndex:  cell.CellIndex,
+                            CellNumber: cell.CellNumber,
+                            SessionID:  sessionID,
+                        })
+                    }
+
+                    room = Room{
+                        SessionID: sessionID,
+                        CreatedAt: time.Now(),
+                        Answers:   answers,
+                        Problems:  problems,
+                    }
+
+                    if err := db.Create(&room).Error; err != nil {
+                        log.Println("DB room creation error:", err)
+                        continue
+                    }
                 }
 
-                initialMessage, err := json.Marshal(room.Answers)
+                // ⭐ ここでは「出題盤面（Problem）」を返す！
+                initialMessage, err := json.Marshal(room.Problems)
                 if err != nil {
                     log.Println("JSON marshal error:", err)
                     continue
@@ -136,6 +208,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
                     log.Println("Write initial board error:", err)
                 } else {
                     log.Println("Sent initial board to this connection!")
+                    log.Println("Room loaded:", room.SessionID, "Problems count:", len(room.Problems))
                 }
 
             case "updateCell":
@@ -153,9 +226,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
                     Update("cell_number", update.CellNumber).Error; err != nil {
                     log.Println("DB update error:", err)
                 } else {
-                    // 全員に反映
                     hub.Broadcast(msg)
                 }
+
             default:
                 log.Println("Unknown message type:", header.Type)
             }
@@ -182,7 +255,7 @@ func main() {
 	defer db.Close()
 
 	// Room, Answer テーブルの自動マイグレーション
-	db.AutoMigrate(&Room{}, &Answer{})
+	db.AutoMigrate(&Room{}, &Answer{}, &Problem{})
 
 	// WebSocket ハンドラをセットアップ
 	http.HandleFunc("/ws", wsHandler)
