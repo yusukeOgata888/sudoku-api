@@ -1,2 +1,3 @@
 DROP TABLE IF EXISTS `answers`;
 DROP TABLE IF EXISTS `problems`;
+DROP TABLE IF EXISTS `submits`;
